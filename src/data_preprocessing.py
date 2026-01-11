@@ -1,3 +1,9 @@
+"""
+Scrapes PubMed database for relevant article based on user query.
+Cleans text from articles and chunks them into smaller documents.
+Embeds documents and uploads vectors to Qdrant database
+"""
+
 from Bio import Entrez
 from lxml import etree
 from io import BytesIO
@@ -7,8 +13,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from collections import defaultdict
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import time
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from langchain_openai.embeddings import OpenAIEmbeddings
+import uuid
 
 Entrez.email = "charlie.kotula@gmail.com"
 Entrez.api_key = "7cdd9ccffdb47c8d3b5e603a22f15ca54309"
@@ -203,13 +213,50 @@ def process_article(article):
     docs = chunk_text(cleaned_text, uid, pmcid, title)
     return docs
 
+def embed_and_upsert(client, embed_model, document_batch):
+    """
+    Embeds text chunks and uploads vectors and their associated metadata to Qdrant
+    """
+    points = []
 
+    # extract text and metadata
+    texts = [doc.page_content for doc in document_batch]
+    metadatas = [doc.metadata for doc in document_batch]  
+
+    # embed text
+    vectors = embed_model.embed_documents(texts)
+    
+    # create points containing embeddings and metadata
+    for vec, doc in zip(vectors, document_batch):
+        # create deterministic identifier for each point
+        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, doc.metadata['chunk_id'])
+        points.append(
+            PointStruct(
+                id=point_id,
+                vector=vec,
+                payload={
+                    **doc.metadata,
+                    'text': doc.page_content
+                }
+            )
+        )
+
+    # upsert points to Qdrant
+    operation_info = client.upsert(
+        collection_name="rehab_collection",
+        wait=True,
+        points=points
+    )
+
+def batched(iterable, batch_size):
+    for i in range(0, len(iterable), batch_size):
+        yield iterable[i : i + batch_size]
+    
 if __name__ == "__main__": 
     # Create metadata list to be used in multiprocessing
     metadata = get_ids_with_metadata(query)
     print(f'retrieved {len(metadata)} articles')
     
-    #### Multiprocessing of articles ####
     documents = []
 
     start_time = time.time()
@@ -223,3 +270,48 @@ if __name__ == "__main__":
         end_time = time.time()
         print(f'processed {len(documents)} documents in {end_time - start_time} seconds')
 
+    
+    #### Batching, embedding, and upserting of chunks
+    batched_docs = [batch for batch in batched(documents, 50)]
+
+    # Connect to Qdrant
+    client = QdrantClient(url="http://localhost:6333")
+    client.create_collection(
+        collection_name="rehab_collection",
+        vectors_config=VectorParams(
+            size=3072,
+            distance=Distance.COSINE
+        )
+    )
+
+    # Instantiate embedding model
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+    # Embed and upsert 
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [
+            executor.submit(
+                embed_and_upsert, 
+                document_batch=batch,
+                client=client,
+                embed_model=embeddings
+            )
+            for batch in batched_docs
+        ]
+        
+        try:
+            future.result()
+        except Exception as e:
+            print("batch failed: ", e)
+
+    end_time = time.time()
+
+    print(f'processed {len(documents)} embedded and upserted in {end_time - start_time} seconds')
+
+    # checking db
+    count = client.count(collection_name='rehab_collection', exact=True)
+    print('count: ', count)
+    
+    # wipe db
+    client.delete_collection('rehab_collection')
